@@ -69,8 +69,9 @@ static int override_cpu;
 
 /** cmdline defs **/
 uint32_t arg_minfreq = 384000;
-uint32_t maxscroff_freq = 486000;
-bool scroff = false;
+uint32_t maxscroff = 0;
+uint32_t maxscroff_freq = 384000;
+uint32_t old_max = 0;
 
 /* min frequency */
 static int __init cpufreq_read_arg_minfreq(char *min_uc)
@@ -89,15 +90,50 @@ static int __init cpufreq_read_arg_minfreq(char *min_uc)
         return 1;
 }
 
-__setup("min_uc=", cpufreq_read_arg_minfreq);/** cmdline end **/
+__setup("min_uc=", cpufreq_read_arg_minfreq);
+
+static int __init cpufreq_read_arg_maxscroff(char *max_so)
+{
+	unsigned long ui_khz;
+	int err;
+
+	err = strict_strtoul(max_so, 0, &ui_khz);
+	if (err) {
+	    maxscroff = 0;
+	    printk(KERN_INFO "[Maxscroff toggle]: max_so='%i'\n", maxscroff);
+	    return 1;
+	}
+
+	maxscroff = ui_khz;
+        return 1;
+}
+
+__setup("max_so=", cpufreq_read_arg_maxscroff);
+
+/** cmdline end **/
 
 
 static int set_cpu_freq(struct cpufreq_policy *policy, unsigned int new_freq)
 {
 	int ret = 0;
+	int saved_sched_policy = -EINVAL; 
+	int saved_sched_rt_prio = -EINVAL; 
 
 	struct cpufreq_freqs freqs;
 	struct cpu_freq *limit = &per_cpu(cpu_freq_info, policy->cpu);
+
+	struct sched_param param = { .sched_priority = MAX_RT_PRIO-1 };
+
+	if (limit->limits_init) {
+		if (new_freq > limit->allowed_max) {
+			new_freq = limit->allowed_max;
+			pr_debug("max: limiting freq to %d\n", new_freq);
+		}
+		if (new_freq < limit->allowed_min) {
+			new_freq = limit->allowed_min;
+			pr_debug("min: limiting freq to %d\n", new_freq);
+		}
+	}
 
 	freqs.old = policy->cur;
 
@@ -123,15 +159,60 @@ static int set_cpu_freq(struct cpufreq_policy *policy, unsigned int new_freq)
 	}
 
 	freqs.cpu = policy->cpu;
+	/*
+	 * Put the caller into SCHED_FIFO priority to avoid cpu starvation
+	 * in the acpuclk_set_rate path while increasing frequencies
+	 */
+
+	if (freqs.new > freqs.old && current->policy != SCHED_FIFO) {
+		saved_sched_policy = current->policy;
+		saved_sched_rt_prio = current->rt_priority;
+		sched_setscheduler_nocheck(current, SCHED_FIFO, &param);
+	}
 	cpufreq_notify_transition(&freqs, CPUFREQ_PRECHANGE);
 	ret = acpuclk_set_rate(policy->cpu, freqs.new, SETRATE_CPUFREQ);
 	if (!ret)
 		cpufreq_notify_transition(&freqs, CPUFREQ_POSTCHANGE);
 
+	/* Restore priority after clock ramp-up */
+	if (freqs.new > freqs.old && saved_sched_policy >= 0) {
+		param.sched_priority = saved_sched_rt_prio;
+		sched_setscheduler_nocheck(current, saved_sched_policy, &param);
+	}
+
 	return ret;
 }
 
 #ifdef CONFIG_SMP
+static int __cpuinit msm_cpufreq_cpu_callback(struct notifier_block *nfb,
+					unsigned long action, void *hcpu)
+{
+	unsigned int cpu = (unsigned long)hcpu;
+
+	switch (action) {
+	case CPU_ONLINE:
+	case CPU_ONLINE_FROZEN:
+		per_cpu(cpufreq_suspend, cpu).device_suspended = 0;
+		break;
+	case CPU_DOWN_PREPARE:
+	case CPU_DOWN_PREPARE_FROZEN:
+		mutex_lock(&per_cpu(cpufreq_suspend, cpu).suspend_mutex);
+		per_cpu(cpufreq_suspend, cpu).device_suspended = 1;
+		mutex_unlock(&per_cpu(cpufreq_suspend, cpu).suspend_mutex);
+		break;
+	case CPU_DOWN_FAILED:
+	case CPU_DOWN_FAILED_FROZEN:
+		per_cpu(cpufreq_suspend, cpu).device_suspended = 0;
+		break;
+	}
+	return NOTIFY_OK;
+}
+
+static struct notifier_block __refdata msm_cpufreq_cpu_notifier = {
+	.notifier_call = msm_cpufreq_cpu_callback,
+
+};
+
 static void set_cpu_work(struct work_struct *work)
 {
 	struct cpufreq_work_struct *cpu_work =
@@ -146,44 +227,21 @@ static void set_cpu_work(struct work_struct *work)
 
 static void msm_cpufreq_early_suspend(struct early_suspend *h)
 {
-	uint32_t curfreq;
-	int cpu;
+	struct cpufreq_policy *policy;
 
-	for_each_possible_cpu(cpu) {
-		mutex_lock(&per_cpu(cpufreq_suspend, cpu).suspend_mutex);
-		if (maxscroff_freq) {
-			scroff = true;
-			curfreq = acpuclk_get_rate(cpu);
-			if (curfreq > maxscroff_freq) {
-				acpuclk_set_rate(cpu, maxscroff_freq, SETRATE_CPUFREQ);
-				curfreq = acpuclk_get_rate(cpu);
-				printk(KERN_INFO "[Freq limiter]: Limited freq to '%u'\n", curfreq);
-			}
-		}
-		mutex_unlock(&per_cpu(cpufreq_suspend, cpu).suspend_mutex);
-	}
+	policy = cpufreq_cpu_get(0);
+	old_max = policy->max;
+	policy->max = maxscroff_freq;
+	printk(KERN_INFO "[Maxscroff]: Limited freq to '%u'\n", maxscroff_freq);
 }
 
 static void msm_cpufreq_late_resume(struct early_suspend *h)
 {
-	uint32_t curfreq;
-	int cpu;
-	struct cpufreq_work_struct *cpu_work;
+	struct cpufreq_policy *policy;
 
-	for_each_possible_cpu(cpu) {
-		mutex_lock(&per_cpu(cpufreq_suspend, cpu).suspend_mutex);
-		if (scroff == true) {
-			scroff = false;
-			cpu_work = &per_cpu(cpufreq_work, cpu);
-			curfreq = acpuclk_get_rate(cpu);
-			if (curfreq != cpu_work->frequency) {
-				acpuclk_set_rate(cpu, cpu_work->frequency, SETRATE_CPUFREQ);
-				curfreq = acpuclk_get_rate(cpu);
-				printk(KERN_INFO "[Freq limiter]: Unlocking freq to '%u'\n", curfreq);
-			}
-		}
-		mutex_unlock(&per_cpu(cpufreq_suspend, cpu).suspend_mutex);
-	}
+	policy = cpufreq_cpu_get(0);
+	policy->max = old_max;
+	printk(KERN_INFO "[Maxscroff]: Restoring freq to '%u'\n", old_max);
 }
 
 static struct early_suspend msm_cpufreq_early_suspend_handler = {
@@ -531,12 +589,15 @@ static int __init msm_cpufreq_register(void)
 
 #ifdef CONFIG_SMP
 	msm_cpufreq_wq = create_workqueue("msm-cpufreq");
+	register_hotcpu_notifier(&msm_cpufreq_cpu_notifier);
 #endif
 
 	register_pm_notifier(&msm_cpufreq_pm_notifier);
 
 /** cmdline **/
-	register_early_suspend(&msm_cpufreq_early_suspend_handler);
+	if (maxscroff == 1) {
+		register_early_suspend(&msm_cpufreq_early_suspend_handler);
+	}
 /** cmdline end **/
 
 	return cpufreq_register_driver(&msm_cpufreq_driver);
